@@ -1,0 +1,8 @@
+services:
+  tuningfork:
+    build: .
+    ports:
+      - "8000:8000"       # API accessible at http://localhost:8000 on your machine
+    volumes:
+      - ./main.py:/app/main.py   # live-reload main.py without rebuilding the image
+    restart: unless-stopped
