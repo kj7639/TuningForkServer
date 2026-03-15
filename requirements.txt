@@ -1,5 +1,8 @@
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
 yt-dlp
-basic-pitch==0.4.0
+basic-pitch[onnx]==0.4.0
+onnxruntime==1.17.0
+numpy<2
 music21==9.1.0
+httpx==0.27.0
