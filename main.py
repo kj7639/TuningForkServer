@@ -3,6 +3,11 @@ import re
 import subprocess
 import tempfile
 import logging
+import hashlib
+from collections import OrderedDict
+
+import numpy as np
+import librosa
 import httpx
 from pathlib import Path
 
@@ -13,7 +18,6 @@ from pydantic import BaseModel
 from basic_pitch.inference import predict_and_save
 from basic_pitch import ICASSP_2022_MODEL_PATH
 import pathlib as _pathlib
-import music21
 from music21 import converter, tempo, meter, key, note, chord, stream
 
 _MODEL_DIR = _pathlib.Path(str(ICASSP_2022_MODEL_PATH)).parent
@@ -22,10 +26,56 @@ ONNX_MODEL_PATH = str(_MODEL_DIR / "nmp.onnx")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── Config ────────────────────────────────────────────────────────────────────
+
+# Trim audio to this many seconds before processing.
+# Chord structure repeats throughout a song so 90s captures everything
+# while cutting download + inference time by ~70%.
+AUDIO_TRIM_SECONDS = 90
+
+# ── Caches ────────────────────────────────────────────────────────────────────
+# Audio cache: both endpoints share trimmed MP3 bytes so we download once.
+_AUDIO_CACHE: OrderedDict[str, bytes] = OrderedDict()
+_AUDIO_CACHE_MAX = 20
+
+# MIDI cache: sheet music endpoint caches Basic Pitch output separately.
+_MIDI_CACHE: OrderedDict[str, bytes] = OrderedDict()
+_MIDI_CACHE_MAX = 20
+
+
+def _cache_key(song_name: str, artist: str) -> str:
+    return hashlib.sha256(f"{song_name.lower()}|{artist.lower()}".encode()).hexdigest()
+
+
+# ── Chord templates for chroma matching ──────────────────────────────────────
+# Each template is a 12-element unit vector over the chromatic pitch classes,
+# ordered C C# D D# E F F# G G# A A# B.
+
+_NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+def _build_templates() -> dict[str, np.ndarray]:
+    MAJOR = np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0], dtype=float)  # root, M3, P5
+    MINOR = np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0], dtype=float)  # root, m3, P5
+    DOM7  = np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0], dtype=float)  # root, M3, P5, m7
+    MAJ7  = np.array([1, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1], dtype=float)  # root, M3, P5, M7
+    MIN7  = np.array([1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0], dtype=float)  # root, m3, P5, m7
+
+    templates: dict[str, np.ndarray] = {}
+    qualities = [("", MAJOR), ("m", MINOR), ("7", DOM7), ("maj7", MAJ7), ("m7", MIN7)]
+    for i, root in enumerate(_NOTE_NAMES):
+        for suffix, base in qualities:
+            t = np.roll(base, i).astype(float)
+            templates[f"{root}{suffix}"] = t / np.linalg.norm(t)
+    return templates
+
+_TEMPLATES = _build_templates()
+
+# ── FastAPI app ───────────────────────────────────────────────────────────────
+
 app = FastAPI(
     title="Tuning Fork API",
     description="Converts a song to sheet music (MusicXML) or chord-annotated lyrics",
-    version="5.0.0",
+    version="6.0.0",
 )
 
 app.add_middleware(
@@ -41,7 +91,7 @@ class SongRequest(BaseModel):
     artist: str
 
 
-# ── Shared: audio download ────────────────────────────────────────────────────
+# ── Audio: download + cache ───────────────────────────────────────────────────
 
 def search_and_download_audio(song_name: str, artist: str, output_dir: str) -> str:
     query = f"ytsearch1:{artist} - {song_name}"
@@ -57,12 +107,79 @@ def search_and_download_audio(song_name: str, artist: str, output_dir: str) -> s
         raise HTTPException(status_code=400, detail=f"Failed to download audio: {result.stderr.strip()}")
     if not os.path.exists(mp3_path):
         raise HTTPException(status_code=500, detail="MP3 file not found after download.")
+
+    # Trim to AUDIO_TRIM_SECONDS — reduces inference time dramatically.
+    trimmed_path = os.path.join(output_dir, "audio_trimmed.mp3")
+    trim = subprocess.run(
+        ["ffmpeg", "-i", mp3_path, "-t", str(AUDIO_TRIM_SECONDS), "-y", trimmed_path],
+        capture_output=True, text=True,
+    )
+    if trim.returncode == 0 and os.path.exists(trimmed_path):
+        os.replace(trimmed_path, mp3_path)
+        logger.info(f"Audio trimmed to {AUDIO_TRIM_SECONDS}s")
+    else:
+        logger.warning("ffmpeg trim failed, using full audio")
+
     return mp3_path
 
 
-# ── Shared: MIDI conversion ───────────────────────────────────────────────────
+def get_audio(song_name: str, artist: str, output_dir: str) -> str:
+    """
+    Returns path to a trimmed MP3 for the song.
+    Cached in memory so both /chords and /sheet-music share one download.
+    """
+    key = _cache_key(song_name, artist)
 
-def convert_audio_to_midi(mp3_path: str, output_dir: str) -> str:
+    if key in _AUDIO_CACHE:
+        logger.info(f"Audio cache hit for: {artist} - {song_name}")
+        audio_path = os.path.join(output_dir, "audio.mp3")
+        with open(audio_path, "wb") as f:
+            f.write(_AUDIO_CACHE[key])
+        _AUDIO_CACHE.move_to_end(key)
+        return audio_path
+
+    logger.info(f"Audio cache miss for: {artist} - {song_name}")
+    audio_path = search_and_download_audio(song_name, artist, output_dir)
+
+    with open(audio_path, "rb") as f:
+        _AUDIO_CACHE[key] = f.read()
+    if len(_AUDIO_CACHE) > _AUDIO_CACHE_MAX:
+        _AUDIO_CACHE.popitem(last=False)
+    logger.info(f"Audio cached ({len(_AUDIO_CACHE)}/{_AUDIO_CACHE_MAX} slots)")
+
+    return audio_path
+
+
+# ── MIDI: Basic Pitch + cache (used only for sheet music) ─────────────────────
+
+def get_midi(song_name: str, artist: str, output_dir: str) -> str:
+    """
+    Returns path to a MIDI file produced by Basic Pitch.
+    Cached separately from audio so /sheet-music skips re-inference.
+    """
+    key = _cache_key(song_name, artist)
+
+    if key in _MIDI_CACHE:
+        logger.info(f"MIDI cache hit for: {artist} - {song_name}")
+        midi_path = os.path.join(output_dir, "cached.mid")
+        with open(midi_path, "wb") as f:
+            f.write(_MIDI_CACHE[key])
+        _MIDI_CACHE.move_to_end(key)
+        return midi_path
+
+    audio_path = get_audio(song_name, artist, output_dir)
+    midi_path = _run_basic_pitch(audio_path, output_dir)
+
+    with open(midi_path, "rb") as f:
+        _MIDI_CACHE[key] = f.read()
+    if len(_MIDI_CACHE) > _MIDI_CACHE_MAX:
+        _MIDI_CACHE.popitem(last=False)
+    logger.info(f"MIDI cached ({len(_MIDI_CACHE)}/{_MIDI_CACHE_MAX} slots)")
+
+    return midi_path
+
+
+def _run_basic_pitch(mp3_path: str, output_dir: str) -> str:
     predict_and_save(
         audio_path_list=[mp3_path],
         output_directory=output_dir,
@@ -83,37 +200,20 @@ def convert_audio_to_midi(mp3_path: str, output_dir: str) -> str:
     return midi_path
 
 
-# ── Post-processing ───────────────────────────────────────────────────────────
+# ── Post-processing (sheet music only) ───────────────────────────────────────
 
-# Minimum note duration to keep — anything shorter is likely transcription noise.
-# music21 uses quarter lengths: 0.125 = 32nd note, 0.25 = 16th note
 MIN_NOTE_DURATION = 0.125
-
-# Quantisation grid in quarter lengths.
-# 0.25 = 16th note grid (good balance of accuracy vs cleanliness)
 QUANTISE_GRID = 0.25
 
 
 def smooth_tempo(score: stream.Score) -> float:
-    """
-    Extract all tempo markings from the score, compute a weighted median BPM,
-    and replace all MetronomeMark objects with a single stable tempo.
-    Returns the chosen BPM.
-    """
     marks = score.flatten().getElementsByClass(tempo.MetronomeMark)
     bpms = [m.number for m in marks if m.number and 40 <= m.number <= 240]
+    chosen_bpm = float(sorted(bpms)[len(bpms) // 2]) if bpms else 120.0
 
-    if not bpms:
-        chosen_bpm = 120.0
-    else:
-        bpms.sort()
-        chosen_bpm = float(bpms[len(bpms) // 2])  # median
-
-    # Remove all existing tempo marks and insert one at the top
     for part in score.parts:
         for m in part.flatten().getElementsByClass(tempo.MetronomeMark):
             m.activeSite.remove(m)
-
     score.parts[0].measure(0 if score.parts[0].measure(0) else 1).insert(
         0, tempo.MetronomeMark(number=chosen_bpm)
     )
@@ -122,60 +222,39 @@ def smooth_tempo(score: stream.Score) -> float:
 
 
 def detect_and_set_key(score: stream.Score) -> key.Key:
-    """
-    Analyse the score to detect its key, insert a KeySignature at the start,
-    and respell notes enharmonically to match the key.
-    """
     detected = score.analyze("key")
     logger.info(f"Detected key: {detected}")
-
     ks = detected.asKey() if hasattr(detected, "asKey") else key.Key(detected.tonic.name, detected.mode)
-
     for part in score.parts:
-        # Insert key signature at the very beginning
         measures = part.getElementsByClass(stream.Measure)
         if measures:
             measures[0].insert(0, ks)
-
-        # Respell all notes to match the key (e.g. Gb → F# in G major)
         for n in part.flatten().getElementsByClass(note.Note):
             try:
                 n.pitch.simplifyEnharmonic(inPlace=True, mostCommon=True)
             except Exception:
                 pass
-
     return detected
 
 
 def infer_time_signature(score: stream.Score) -> str:
-    """
-    Check if the score already has a sensible time signature; if not,
-    attempt to infer one from the note density, defaulting to 4/4.
-    Returns the time signature string used.
-    """
     existing = score.flatten().getElementsByClass(meter.TimeSignature)
     if existing:
         ts_str = existing[0].ratioString
         logger.info(f"Keeping existing time signature: {ts_str}")
         return ts_str
 
-    # Simple heuristic: count notes per bar and pick the most common grouping
     ts_str = "4/4"
     try:
-        notes_per_measure = []
-        for part in score.parts:
-            for m in part.getElementsByClass(stream.Measure):
-                n_count = len(m.flatten().getElementsByClass(note.Note))
-                if n_count > 0:
-                    notes_per_measure.append(n_count)
+        notes_per_measure = [
+            len(m.flatten().getElementsByClass(note.Note))
+            for part in score.parts
+            for m in part.getElementsByClass(stream.Measure)
+            if len(m.flatten().getElementsByClass(note.Note)) > 0
+        ]
         if notes_per_measure:
             avg = sum(notes_per_measure) / len(notes_per_measure)
-            if avg <= 3:
-                ts_str = "3/4"
-            elif avg >= 6:
-                ts_str = "6/8"
-            else:
-                ts_str = "4/4"
+            ts_str = "3/4" if avg <= 3 else "6/8" if avg >= 6 else "4/4"
     except Exception:
         pass
 
@@ -184,16 +263,11 @@ def infer_time_signature(score: stream.Score) -> str:
         measures = part.getElementsByClass(stream.Measure)
         if measures:
             measures[0].insert(0, ts)
-
     logger.info(f"Set time signature: {ts_str}")
     return ts_str
 
 
 def filter_short_notes(score: stream.Score, min_duration: float = MIN_NOTE_DURATION) -> stream.Score:
-    """
-    Remove notes and chords shorter than min_duration quarter lengths.
-    These are almost always transcription artefacts rather than real notes.
-    """
     removed = 0
     for part in score.parts:
         for n in part.flatten().getElementsByClass((note.Note, chord.Chord)):
@@ -208,14 +282,9 @@ def filter_short_notes(score: stream.Score, min_duration: float = MIN_NOTE_DURAT
 
 
 def quantise_score(score: stream.Score, grid: float = QUANTISE_GRID) -> stream.Score:
-    """
-    Snap all note onsets and durations to the nearest grid value.
-    This makes the notation significantly cleaner in the rendered score.
-    """
-    quarter_length_divisors = [1.0 / grid]
     try:
         score = score.quantize(
-            quarterLengthDivisors=quarter_length_divisors,
+            quarterLengthDivisors=[1.0 / grid],
             processOffsets=True,
             processDurations=True,
             inPlace=False,
@@ -227,10 +296,6 @@ def quantise_score(score: stream.Score, grid: float = QUANTISE_GRID) -> stream.S
 
 
 def merge_short_rests(score: stream.Score, min_rest: float = 0.25) -> stream.Score:
-    """
-    Remove rests shorter than min_rest quarter lengths to reduce clutter.
-    Short rests between notes are often quantisation artefacts.
-    """
     removed = 0
     for part in score.parts:
         for r in part.flatten().getElementsByClass(note.Rest):
@@ -245,49 +310,29 @@ def merge_short_rests(score: stream.Score, min_rest: float = 0.25) -> stream.Sco
 
 
 def post_process_score(score: stream.Score) -> stream.Score:
-    """
-    Apply all post-processing steps in order to clean up a raw Basic Pitch score.
-    """
     logger.info("Starting score post-processing...")
-
-    # 1. Filter noise notes first so they don't affect analysis steps
     score = filter_short_notes(score)
-
-    # 2. Quantise to a clean rhythmic grid
     score = quantise_score(score)
-
-    # 3. Remove short rests left behind by quantisation
     score = merge_short_rests(score)
-
-    # 4. Smooth erratic tempo markings to a single stable BPM
     try:
         smooth_tempo(score)
     except Exception as e:
         logger.warning(f"Tempo smoothing failed: {e}")
-
-    # 5. Detect key and respell enharmonics
     try:
         detect_and_set_key(score)
     except Exception as e:
         logger.warning(f"Key detection failed: {e}")
-
-    # 6. Infer or verify time signature
     try:
         infer_time_signature(score)
     except Exception as e:
         logger.warning(f"Time signature inference failed: {e}")
-
-    # 7. Final notation cleanup (beam grouping, tie merging, etc.)
     try:
         score = score.makeNotation(inPlace=False)
     except Exception as e:
         logger.warning(f"makeNotation failed: {e}")
-
     logger.info("Post-processing complete")
     return score
 
-
-# ── Sheet music: MIDI → MusicXML ─────────────────────────────────────────────
 
 def convert_midi_to_musicxml(midi_path: str, output_dir: str) -> str:
     logger.info(f"Converting MIDI to MusicXML: {midi_path}")
@@ -301,76 +346,60 @@ def convert_midi_to_musicxml(midi_path: str, output_dir: str) -> str:
     return xml_content
 
 
-# ── Chords: extraction ────────────────────────────────────────────────────────
+# ── Chords: chromagram extraction ─────────────────────────────────────────────
 
-def _chord_label(root: str, quality: str) -> str:
-    q_map = {
-        "major": "", "minor": "m", "diminished": "dim", "augmented": "aug",
-        "dominant-seventh": "7", "major-seventh": "maj7", "minor-seventh": "m7",
-        "half-diminished": "m7b5", "diminished-seventh": "dim7",
-        "suspended-fourth": "sus4", "suspended-second": "sus2",
-    }
-    return f"{root}{q_map.get(quality, '')}"
-
-
-def _offset_to_seconds(offset, score: stream.Score) -> float:
-    try:
-        mm = score.flatten().getElementsByClass(tempo.MetronomeMark)
-        bpm = mm[0].number if mm else 120.0
-    except Exception:
-        bpm = 120.0
-    return float(offset) * (60.0 / bpm)
-
-
-def extract_chords(midi_path: str, min_chord_duration: float = 0.5) -> list[dict]:
+def extract_chords_from_audio(audio_path: str) -> list[dict]:
     """
-    Parse MIDI, apply post-processing, chordify, then extract chords.
-    min_chord_duration filters out chords shorter than N quarter lengths
-    to remove spurious detections (default: 0.5 = 8th note).
+    Chromagram-based chord recognition using librosa.
+
+    Uses 0.5-second CQT frames so chord changes at normal song tempos are
+    captured, then applies a 5-frame median filter to smooth out noise before
+    template matching. Consecutive duplicate labels are collapsed so the output
+    contains one entry per distinct chord segment.
     """
-    logger.info("Extracting chords from MIDI...")
-    score = converter.parse(midi_path)
+    logger.info("Running chroma-based chord recognition...")
 
-    # Apply the same note filtering and quantisation used for sheet music
-    # so chord detection benefits from the same cleanup
-    score = filter_short_notes(score)
-    score = quantise_score(score)
+    y, sr = librosa.load(audio_path, sr=22050, mono=True)
 
-    # Detect key for better root note spelling
-    try:
-        detect_and_set_key(score)
-    except Exception:
-        pass
+    # 0.5-second hop: fine enough for typical chord changes (1–2 beats at
+    # 120 BPM ≈ 0.5–1 s) without being so short that noise dominates.
+    hop_length = sr // 2
 
-    chordified = score.chordify()
-    chords_out = []
-    last_label = None
+    # CQT chroma has better frequency resolution than STFT chroma and
+    # captures low-register instruments (bass, guitar) more reliably.
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
 
-    for c in chordified.flatten().getElementsByClass(chord.Chord):
-        # Skip chords that are too short to be intentional
-        if c.duration.quarterLength < min_chord_duration:
+    # Median-filter across 5 frames (~2.5 s) to smooth transients while
+    # keeping genuine chord changes sharper than CENS smoothing would.
+    from scipy.ndimage import median_filter
+    chroma = median_filter(chroma, size=(1, 5))
+
+    chords_out: list[dict] = []
+    prev_label: str | None = None
+
+    for frame_idx in range(chroma.shape[1]):
+        frame = chroma[:, frame_idx]
+        norm = float(np.linalg.norm(frame))
+        if norm < 0.01:  # near-silence
             continue
-        if len(c.pitches) < 2:
-            continue
-        try:
-            root = c.root().name
-            quality = c.quality
-        except Exception:
+        frame = frame / norm
+
+        best_label, best_score = None, 0.0
+        for label, template in _TEMPLATES.items():
+            score = float(np.dot(frame, template))
+            if score > best_score:
+                best_score = score
+                best_label = label
+
+        # Lower threshold catches more valid chords; dedup handles repeats.
+        if best_label is None or best_score < 0.65 or best_label == prev_label:
             continue
 
-        label = _chord_label(root, quality)
-        if label == last_label:
-            continue
-        last_label = label
+        timestamp = librosa.frames_to_time(frame_idx, sr=sr, hop_length=hop_length)
+        chords_out.append({"chord": best_label, "timestamp": round(float(timestamp), 2)})
+        prev_label = best_label
 
-        chords_out.append({
-            "chord": label,
-            "quality": quality,
-            "root": root,
-            "timestamp": round(_offset_to_seconds(c.offset, score), 2),
-        })
-
-    logger.info(f"Extracted {len(chords_out)} chords after filtering")
+    logger.info(f"Detected {len(chords_out)} chords via chroma analysis")
     return chords_out
 
 
@@ -445,15 +474,13 @@ def _delete_dir(path: str) -> None:
 @app.post("/sheet-music", summary="Convert a song to MusicXML sheet music")
 async def get_sheet_music(request: SongRequest):
     """
-    Downloads audio, runs Basic Pitch, post-processes and converts
-    MIDI → MusicXML via music21.
+    Downloads audio (cached), runs Basic Pitch (cached), post-processes and
+    converts MIDI → MusicXML via music21.
     Returns JSON: { song_name, artist, musicxml }
     """
     work_dir = tempfile.mkdtemp(prefix="song2sheet_")
     try:
-        mp3_path = search_and_download_audio(request.song_name, request.artist, work_dir)
-        midi_path = convert_audio_to_midi(mp3_path, work_dir)
-        os.remove(mp3_path)
+        midi_path = get_midi(request.song_name, request.artist, work_dir)
         musicxml = convert_midi_to_musicxml(midi_path, work_dir)
         return JSONResponse(content={
             "song_name": request.song_name,
@@ -474,16 +501,14 @@ async def get_sheet_music(request: SongRequest):
 @app.post("/chords", summary="Convert a song to chord-annotated lyrics")
 async def get_chords(request: SongRequest):
     """
-    Downloads audio, runs Basic Pitch, extracts cleaned chords, fetches
-    synced lyrics from lrclib and aligns chords to lyric lines.
+    Downloads audio (cached), runs chromagram-based chord recognition,
+    fetches synced lyrics from lrclib and aligns chords to lyric lines.
     Returns JSON: { song_name, artist, has_lyrics, lines, all_chords }
     """
     work_dir = tempfile.mkdtemp(prefix="song2chords_")
     try:
-        mp3_path = search_and_download_audio(request.song_name, request.artist, work_dir)
-        midi_path = convert_audio_to_midi(mp3_path, work_dir)
-        os.remove(mp3_path)
-        chords = extract_chords(midi_path)
+        audio_path = get_audio(request.song_name, request.artist, work_dir)
+        chords = extract_chords_from_audio(audio_path)
         lyric_lines = fetch_synced_lyrics(request.song_name, request.artist)
         if lyric_lines:
             lines = align_chords_to_lyrics(lyric_lines, chords)
